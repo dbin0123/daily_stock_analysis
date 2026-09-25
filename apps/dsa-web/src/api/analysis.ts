@@ -11,6 +11,8 @@ import type {
   TaskStatus,
   TaskListResponse,
 } from '../types/analysis';
+import type { RunFlowSnapshot } from '../types/runFlow';
+import { serializeMarketReviewRegions } from '../utils/marketReviewRegion';
 
 // ============ API Interfaces ============
 
@@ -32,6 +34,7 @@ export const analysisApi = {
       original_query: data.originalQuery,
       selection_source: data.selectionSource,
       skills: data.skills,
+      report_language: data.reportLanguage,
       ...(data.notify !== undefined && { notify: data.notify }),
     };
 
@@ -67,6 +70,7 @@ export const analysisApi = {
       original_query: data.originalQuery,
       selection_source: data.selectionSource,
       skills: data.skills,
+      report_language: data.reportLanguage,
       ...(data.notify !== undefined && { notify: data.notify }),
     };
 
@@ -101,6 +105,8 @@ export const analysisApi = {
       '/api/v1/analysis/market-review',
       {
         send_notification: data.sendNotification ?? true,
+        report_language: data.reportLanguage,
+        ...(data.regions !== undefined && { region: serializeMarketReviewRegions(data.regions) }),
       },
       {
         validateStatus: (status) => status === 202 || status === 409,
@@ -156,6 +162,18 @@ export const analysisApi = {
     const data = toCamelCase<TaskListResponse>(response.data);
 
     return data;
+  },
+
+  /**
+   * Get a run-flow snapshot for an active analysis task.
+   * @param taskId Task ID
+   */
+  getTaskFlow: async (taskId: string): Promise<RunFlowSnapshot> => {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/analysis/tasks/${encodeURIComponent(taskId)}/flow`
+    );
+
+    return toCamelCase<RunFlowSnapshot>(response.data);
   },
 
   /**

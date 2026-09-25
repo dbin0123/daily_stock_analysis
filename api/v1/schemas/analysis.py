@@ -13,8 +13,9 @@
 from typing import Optional, List, Any, Literal
 from enum import Enum
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from src.utils.analysis_metadata import SELECTION_SOURCE_PATTERN
+from src.utils.market_review_region import normalize_market_review_region_strict
 
 
 class TaskStatusEnum(str, Enum):
@@ -23,6 +24,8 @@ class TaskStatusEnum(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCEL_REQUESTED = "cancel_requested"
+    CANCELLED = "cancelled"
 
 
 AnalysisPhase = Literal["auto", "premarket", "intraday", "postmarket"]
@@ -78,6 +81,11 @@ class AnalyzeRequest(BaseModel):
         True,
         description="是否发送推送通知（Telegram/企业微信等）"
     )
+    report_language: Optional[Literal["zh", "en", "ko"]] = Field(
+        None,
+        validation_alias=AliasChoices("report_language", "reportLanguage"),
+        description="本次分析报告输出语言；未传时使用全局 REPORT_LANGUAGE",
+    )
     skills: Optional[List[str]] = Field(
         None,
         validation_alias=AliasChoices("skills", "strategies"),
@@ -96,6 +104,7 @@ class AnalyzeRequest(BaseModel):
             "original_query": "茅台",
             "selection_source": "autocomplete",
             "notify": True,
+            "report_language": "zh",
             "skills": ["bull_trend"]
         }
     })
@@ -108,6 +117,34 @@ class MarketReviewRequest(BaseModel):
         True,
         description="是否在大盘复盘完成后发送推送通知",
     )
+    report_language: Optional[Literal["zh", "en", "ko"]] = Field(
+        None,
+        validation_alias=AliasChoices("report_language", "reportLanguage"),
+        description="本次大盘复盘报告输出语言；未传时使用全局 REPORT_LANGUAGE",
+    )
+    region: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=64,
+        description=(
+            "本次大盘复盘市场覆盖。合法 token 为 cn、hk、us、jp、kr、both；"
+            "both 只能单独使用，其余 token 可用逗号组合。输入会忽略大小写和 token 两侧空格、"
+            "去重并按 cn,hk,us,jp,kr 排序；空值、空 token、未知 token、both 混用或超过 "
+            "64 个字符会整体返回 4xx，不会部分执行。未传时使用运行时全局 MARKET_REVIEW_REGION。"
+        ),
+        json_schema_extra={
+            "example": "cn,us",
+            "examples": ["cn", "jp,kr", "both"],
+        },
+    )
+
+    @field_validator("region")
+    @classmethod
+    def normalize_region(cls, value: Optional[str]) -> Optional[str]:
+        """Strictly validate request input and return its canonical ordering."""
+        if value is None:
+            return None
+        return normalize_market_review_region_strict(value)
 
 
 class MarketReviewAccepted(BaseModel):
@@ -116,6 +153,11 @@ class MarketReviewAccepted(BaseModel):
     status: str = Field("accepted", description="提交状态")
     message: str = Field(..., description="提示信息")
     send_notification: bool = Field(..., description="是否发送通知")
+    region: str = Field(
+        ...,
+        description="本次任务实际执行的 canonical 市场范围",
+        examples=["us", "jp,kr"],
+    )
     trace_id: Optional[str] = Field(
         None,
         description="本次后台任务的诊断 trace ID",
@@ -189,6 +231,10 @@ class BatchTaskAcceptedItem(BaseModel):
     )
     message: Optional[str] = Field(None, description="提示信息")
     analysis_phase: AnalysisPhase = Field("auto", description="请求的分析阶段")
+    asset_type: Optional[Literal["stock", "index"]] = Field(
+        None,
+        description="parser 来源的可选资产类型（stock/index）；由已提交的 analysis_target 透传，旧客户端可缺省",
+    )
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
@@ -217,11 +263,29 @@ class BatchDuplicateTaskItem(BaseModel):
     })
 
 
+class RejectedTaskItem(BaseModel):
+    """批量异步任务中被明确拒绝的单个目标项（如未登记 CSI 指数）。"""
+
+    stock_code: str = Field(..., description="被拒绝的目标代码")
+    message: str = Field(..., description="拒绝原因")
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "stock_code": "930956.CSI",
+            "message": "unregistered CSI index: '930956.CSI' is not in the index registry",
+        }
+    })
+
+
 class BatchTaskAcceptedResponse(BaseModel):
     """批量异步任务接受响应。"""
 
     accepted: List[BatchTaskAcceptedItem] = Field(default_factory=list, description="成功提交的任务列表")
     duplicates: List[BatchDuplicateTaskItem] = Field(default_factory=list, description="重复而跳过的任务列表")
+    rejected: Optional[List[RejectedTaskItem]] = Field(
+        None,
+        description="批量中被明确拒绝的目标列表（如未登记 CSI 指数），仅在异步批量请求中返回",
+    )
     message: str = Field(..., description="汇总信息")
 
     model_config = ConfigDict(json_schema_extra={
@@ -252,10 +316,9 @@ class TaskStatus(BaseModel):
     
     task_id: str = Field(..., description="任务 ID")
     trace_id: Optional[str] = Field(None, description="诊断 trace ID")
-    status: str = Field(
+    status: TaskStatusEnum = Field(
         ..., 
         description="任务状态",
-        pattern="^(pending|processing|completed|failed)$"
     )
     progress: Optional[int] = Field(
         None, 
@@ -274,6 +337,10 @@ class TaskStatus(BaseModel):
     market_review_payload: Optional[Any] = Field(
         None,
         description="Structured market-review payload for API/Web consumers.",
+    )
+    region: Optional[str] = Field(
+        None,
+        description="大盘复盘任务实际执行的 canonical 市场范围",
     )
     error: Optional[str] = Field(
         None, 
@@ -336,6 +403,14 @@ class TaskInfo(BaseModel):
     )
     analysis_phase: AnalysisPhase = Field("auto", description="请求的分析阶段")
     skills: Optional[List[str]] = Field(None, description="本次任务使用的策略 skill ID 列表")
+    region: Optional[str] = Field(
+        None,
+        description="大盘复盘任务实际执行的 canonical 市场范围",
+    )
+    asset_type: Optional[Literal["stock", "index"]] = Field(
+        None,
+        description="parser 来源的可选资产类型（stock/index）；由已提交的 analysis_target 透传，旧客户端可缺省",
+    )
     
     model_config = ConfigDict(json_schema_extra={
         "example": {

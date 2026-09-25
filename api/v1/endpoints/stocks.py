@@ -24,6 +24,7 @@ from api.v1.schemas.stocks import (
     ExtractItem,
     KLineData,
     StockHistoryResponse,
+    StockProfileResponse,
     StockQuote,
 )
 from api.v1.schemas.history import WatchlistRequest, WatchlistResponse
@@ -39,6 +40,9 @@ from src.services.import_parser import (
     parse_import_from_text,
 )
 from src.services.stock_service import StockService
+from src.services.stock_profile_service import InvalidStockProfileCode, StockProfileService
+from src.services.run_diagnostics import sanitize_diagnostic_text
+from src.services.stock_list_parser import split_stock_list
 from src.services.system_config_service import SystemConfigService
 from data_provider.base import normalize_stock_code
 
@@ -58,7 +62,7 @@ def _read_watchlist_codes(service: SystemConfigService) -> list:
         if item.get("key") == "STOCK_LIST":
             stock_list_str = str(item.get("value", ""))
             break
-    return [c.strip() for c in stock_list_str.split(",") if c.strip()]
+    return split_stock_list(stock_list_str)
 
 
 def _write_watchlist_codes(service: SystemConfigService, codes: list) -> None:
@@ -81,6 +85,9 @@ _STOCK_CODE_RE = re.compile(
     r"|\d{1,5}\.HK"                           # HK suffix format
     r"|HK\d{1,5}"                             # HK prefix format
     r"|\d{5}"                                 # bare 5-digit HK code
+    r"|\d{4,5}\.T"                            # Japan Yahoo suffix format
+    r"|\d{6}\.(?:KS|KQ)"                     # Korea Yahoo suffix format
+    r"|\d{4,6}\.(?:TW|TWO)"                  # Taiwan Yahoo suffix format
     r"|[A-Z]{1,5}(?:\.(?:US|[A-Z]))?"         # US ticker
     r")$",
     re.IGNORECASE,
@@ -107,6 +114,14 @@ def _validate_and_normalize_stock_code(code: str) -> str:
             },
         )
     return normalize_stock_code(stripped)
+
+
+def _watchlist_match_key(code: str) -> str:
+    """Return the equivalence key used for watchlist add/remove matching."""
+    normalized = normalize_stock_code(code.strip())
+    if re.fullmatch(r"\d{5}", normalized):
+        return f"HK{normalized}"
+    return normalized.upper()
 
 
 @router.post(
@@ -346,8 +361,8 @@ def add_to_watchlist(
     try:
         validated = _validate_and_normalize_stock_code(request.stock_code)
         codes = _read_watchlist_codes(service)
-        normalized_existing = [normalize_stock_code(c) for c in codes]
-        if validated not in normalized_existing:
+        existing_keys = [_watchlist_match_key(c) for c in codes]
+        if _watchlist_match_key(validated) not in existing_keys:
             codes.append(request.stock_code.strip())
             _write_watchlist_codes(service, codes)
         return WatchlistResponse(stock_codes=codes, message=f"已加入 {request.stock_code.strip()}")
@@ -379,10 +394,11 @@ def remove_from_watchlist(
     try:
         validated = _validate_and_normalize_stock_code(request.stock_code)
         codes = _read_watchlist_codes(service)
-        normalized_existing = [normalize_stock_code(c) for c in codes]
-        if validated in normalized_existing:
-            idx = normalized_existing.index(validated)
-            removed = codes.pop(idx)
+        existing_keys = [_watchlist_match_key(c) for c in codes]
+        requested_key = _watchlist_match_key(validated)
+        if requested_key in existing_keys:
+            idx = existing_keys.index(requested_key)
+            codes.pop(idx)
             _write_watchlist_codes(service, codes)
         return WatchlistResponse(stock_codes=codes, message=f"已移除 {request.stock_code.strip()}")
     except HTTPException:
@@ -392,6 +408,40 @@ def remove_from_watchlist(
         raise HTTPException(
             status_code=500,
             detail={"error": "internal_error", "message": f"从自选删除失败: {str(e)}"},
+        )
+
+
+@router.get(
+    "/{stock_code}/profile",
+    response_model=StockProfileResponse,
+    responses={
+        400: {"description": "股票代码无效", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="获取个股研究聚合档案",
+    description="按独立质量状态聚合行情、历史、研究产物、资讯、持仓关系和监控规则。",
+)
+def get_stock_profile(
+    stock_code: str,
+    history_days: int = Query(60, ge=1, le=365, description="日线历史天数"),
+) -> StockProfileResponse:
+    """Return partial profile data without failing on one optional block."""
+    _validate_and_normalize_stock_code(stock_code)
+    try:
+        return StockProfileResponse(
+            **StockProfileService().get_profile(stock_code, history_days=history_days)
+        )
+    except InvalidStockProfileCode:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_stock_code", "message": "股票代码与交易所不匹配"},
+        )
+    except Exception as exc:
+        sanitized = sanitize_diagnostic_text(str(exc), max_length=300) or "internal profile error"
+        logger.error("获取个股研究聚合档案失败: %s", sanitized)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": "获取个股研究聚合档案失败"},
         )
 
 
